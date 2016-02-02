@@ -5,7 +5,7 @@ Zabbix User Parameters
 
 ### Content
 
-* Docker Registry (work-in-progress)
+* Docker client (work-in-progress)
 * Swift storage (work-in-progress)
 * Redis database (tbc)
 * Zookeeper (tbc)
@@ -17,3 +17,7 @@ TBC
 ### Usage
 
 TBC
+
+### Future work
+
+* Docker Registry (tbd)

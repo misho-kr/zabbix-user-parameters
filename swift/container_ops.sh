@@ -174,6 +174,7 @@ function query_cache_file {
 #
 # simplified version of: http://wiki.bash-hackers.org/howto/mutex
 #
+
 function acquire_lock_wait() {
   local lock="${1}"
   declare -i retry=${CACHE_RETRY_TIMES}
@@ -198,7 +199,7 @@ function acquire_lock_wait() {
 
     elif mkdir "${lock}" &> /dev/null; then
       # 2. lock acquired
-      trap 'rm -r "${lock}"' SIGINT SIGTERM SIGHUP
+      trap 'on_error_handler "${lock}" $?' SIGINT SIGTERM SIGHUP
       echo $$ > "${lock}"/pid
       break
     # else 3. lock missed, i.e. some other process grabbed it before us, bummer
@@ -211,6 +212,14 @@ function acquire_lock_wait() {
 
 function release_lock() {
   rm -r "${1}"
+}
+
+function on_error_handler() {
+  local lock="${1}"
+  local exit_code="${2}"
+
+  release_lock "${lock}"
+  exit "${exit_code}"
 }
 
 # main ----------------------------------------------------------------

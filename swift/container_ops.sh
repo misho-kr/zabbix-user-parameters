@@ -134,8 +134,19 @@ function should_cache_be_refreshed() {
   (( $(now) > (cache_ts + CACHE_TEST_TTL) ))
 }
 
-function merge_files() {
-  join -t: -v1 -11 $1 $2 ; join -t: -v2 -11 $1 $2 ; (join -t: -11 $1 $2 | cut -d: -f1,4,5)
+# merge files $1 and $2, and store the result in $1
+# note: file $2 will be used as temp file and will be removed at end
+function merge_cache_files() {
+  local old="${1}"
+  local new="${2}"
+  local tmp="$(mktemp)"
+
+  sort ${new} > ${tmp}
+  ( join -t: -j1 -v1 ${old} ${tmp} ; \
+      join -t: -j1 -v2 ${old} ${tmp} ; \
+        (join -t: -j1    ${old} ${tmp} | cut -d: -f1,4,5 | sort -u)) | sort > ${new}
+
+  rm ${tmp} && mv ${new} ${old}
 }
 
 function refresh_cache_file() {
@@ -146,9 +157,7 @@ function refresh_cache_file() {
 
   # temp files
   local cache_new="${cache}-new"
-  local cache_merged="${cache}-merged"
-
-  trap 'rm -f ${cache_new} ${cache_merged}' EXIT
+  trap 'rm -f ${cache_new}' EXIT
 
   # execute all swift tests and record the results
   f="${lock}/testfile.dat"
@@ -178,10 +187,8 @@ function refresh_cache_file() {
 
   set -e
 
-  test -f ${cache} || touch ${cache}
-  merge_files ${cache} ${cache_new} > ${cache_merged} && \
-    cp ${cache_merged} ${cache} &&
-    rm ${cache_new} ${cache_merged}
+  # merge the two files, store the result in $cache, and remove $cache_new
+  merge_cache_files ${cache} ${cache_new}
 }
 
 function query_cache_file {
@@ -213,6 +220,14 @@ function query_cache_file {
 #
 # simplified version of: http://wiki.bash-hackers.org/howto/mutex
 #
+
+function on_error_handler() {
+  local lock="${1}"
+  local exit_code="${2}"
+
+  release_lock "${lock}"
+  exit "${exit_code}"
+}
 
 function acquire_lock_wait() {
   local lock="${1}"
@@ -251,14 +266,6 @@ function acquire_lock_wait() {
 
 function release_lock() {
   rm -r "${1}"
-}
-
-function on_error_handler() {
-  local lock="${1}"
-  local exit_code="${2}"
-
-  release_lock "${lock}"
-  exit "${exit_code}"
 }
 
 # main ----------------------------------------------------------------

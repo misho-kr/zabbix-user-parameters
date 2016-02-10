@@ -5,40 +5,19 @@
 
 set -e
 
-ZABBIX_AGENT_CONF="/etc/zabbix/zabbix_agentd.conf"
-DEFAULT_ZABBIX_CONF_DIR="/etc/zabbix/zabbix_agentd.conf.d/"
+ZABBIX_CONF_DIR="/etc/zabbix"
+# ZABBIX_AGENT_CONF="${ZABBIX_CONF_DIR}/zabbix_agentd.conf"
+ZABBIX_AGENT_SCRIPTS="${ZABBIX_CONF_DIR}/scripts"
 
-ZABBIX_CONF_DIR="$(grep '^Include=' ${ZABBIX_AGENT_CONF} | cut -d= -f2)"
-ZABBIX_CONF_DIR="${ZABBIX_CONF_DIR:-${DEFAULT_ZABBIX_CONF_DIR}}"
+source "${ZABBIX_AGENT_SCRIPTS}/swift/container_ops.conf"
 
-CREDFILE="$(dirname "${ZABBIX_AGENT_CONF}")/openrc.sh"
+# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+#                         Swift operations
+# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
 
-WORKDIR="/tmp"
-CACHE_FORCE_UPDATE="no"
-
-declare -a IO_TEST_COMMANDS=(upload verify download)
-
-declare -i CACHE_IO_TEST_TTL=50       # seconds
-declare -i CACHE_TEST_TTL=240         # seconds
-
-declare -i CACHE_RETRY_PAUSE=10       # seconds
-declare -i CACHE_RETRY_TIMES=10       # N times
-
-SWIFT_TESTFILE_SIZE="1K"    # Bytes, KBtytes, MBytes, etc.
-
-SWIFT_TEST_CONTAINER="ZABBIX_SWIFT_TEST_CONTAINER"
-SWIFT_TEST_IO_CONTAINER="ZABBIX_SWIFT_IO_TEST_CONTAINER"
-
-function usage() {
-  echo "usage: $0 -a -c <openstack cred file> -d <workdir> -f swift-command"
-  echo
-
-  exit 1
-}
-
-# Swift operations -----------------------------------------------------
-
-# read openstack credentials from environment, fallback to credentials file
+# read openstack credentials from environment, override in openrc file
 function load_openstack_credentials() {
   local cred_file="${1}"
 
@@ -47,7 +26,13 @@ function load_openstack_credentials() {
   os_username="${OS_USERNAME}"
   os_password="${OS_PASSWORD}"
 
-  source "${cred_file}"
+  if [[ "$(basename ${cred_file})" == "${cred_file}" && ! -r "${cred_file}" ]]; then
+    cred_file="${ZABBIX_AGENT_SCRIPTS}/${cred_file}"
+  fi
+
+  if test -r "${cred_file}"; then
+    source "${cred_file}"
+  fi
 
   os_auth_url="${os_auth_url:-${OS_AUTH_URL}}"
   os_tenant_name="${os_tenant_name:-${OS_TENANT_NAME}}"
@@ -68,7 +53,7 @@ function swift_op() {
 
 # execute swift operation and send all output to /dev/null
 function swift_op_noout() {
-  swift_op $* > /dev/null 2>&1
+  swift_op $* &> /dev/null
   echo $?
 }
 
@@ -97,41 +82,103 @@ function download_container() {
 }
 
 # 7. Verify swift container
-function verify_container() {
-  local datafile="${1}"
-  local datafile_copy="${2}"
+function verify_container() { cmp -s "${1}" "${2}"; echo $?; }
 
-  cmp -s "${datafile}" "${datafile_copy}"
-  echo $?
-}
+# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+#                          cache operations
+# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
 
-# cache operations ----------------------------------------------------
+declare -a IO_TEST_COMMANDS=(upload download verify delete_o)
 
 function now() { echo "$(date +%s)" ; }
 function is_io_test() {
   local op=${1}
-  declare -i i
 
-  while [[ "${IO_TEST_COMMANDS[i]}" != "" ]]; do
+  for i in $(seq 0 $(( ${#IO_TEST_COMMANDS[@]} -1 )) ); do
     if [[ "${IO_TEST_COMMANDS[i]}" == ${op} ]]; then
       return 0 # found, i.e. op is io-test
     fi
-    (( i += 1 ))
   done
 
   return 1 # not found, i.e. op is not io-test
 }
 
-function should_cache_be_refreshed() {
+function get_cache_state() {
   local op=${1}
   declare -i cache_ts=${2}
 
   is_io_test ${op}
-  local is_io_test_op=$?
+  declare -i is_io_test_op=$?
 
-  [[ "${CACHE_FORCE_UPDATE}" == "yes" ]] || \
-  (( is_io_test_op == 0 && $(now) > (cache_ts + CACHE_IO_TEST_TTL) )) || \
-  (( $(now) > (cache_ts + CACHE_TEST_TTL) ))
+  if \
+    (( $is_io_test_op == 0 && $(now) > (cache_ts + (CACHE_MAX_TTL_AGE * CACHE_IO_TEST_TTL)) )) || \
+    (( $(now) > (cache_ts + (CACHE_MAX_TTL_AGE * CACHE_TEST_TTL)) ))
+  then
+    echo "obsolete"
+
+  elif \
+    (( $is_io_test_op == 0 && $(now) > (cache_ts + CACHE_IO_TEST_TTL) )) || \
+    (( $(now) > (cache_ts + CACHE_TEST_TTL) ))
+  then
+    echo "stale"
+  else
+    echo "current"
+  fi
+}
+
+function query_cache_file {
+  local cache="${1}"
+  local op="${2}"
+
+  local cache_entry=""
+  local cache_value=""
+  declare -i cache_ts=0
+
+  if test -f "${cache}"; then
+    cache_entry=$(sed -n "s/^$op:\(.*\):\(.*\)$/\1:\2/p" "${cache}")
+    cache_ts="${cache_entry%%:*}"
+    cache_value="${cache_entry#*:}"
+  fi
+
+  case "$(get_cache_state ${op} ${cache_ts:-0})" in
+    "obsolete" ) update_cache_file_background $* ; echo "1" ;;
+    "stale"    ) update_cache_file_background $* ; echo "${cache_value}" ;;
+    "current"  )
+        [[ "${CACHE_FORCE_UPDATE}" == "yes" ]] && update_cache_file_background $*
+        echo "${cache_value}"
+        ;;
+    *)
+        echo "-1"
+        ;;
+  esac
+}
+
+function update_cache_file_background() {
+  (update_cache_file $*) &
+}
+
+function update_cache_file() {
+  local cache="${1}"
+  local swift_op="${2}"
+  shift 2
+
+  trap '' HUP
+
+  local lock="${WORKDIR}/zabbix-swift-monitor.lock"
+  local container="${SWIFT_TEST_CONTAINER}:$(hostname)"
+
+  if is_io_test ${swift_op}; then
+    container="${SWIFT_TEST_IO_CONTAINER}:$(hostname)"
+  fi
+
+  if acquire_lock_wait "${lock}"; then
+    refresh_cache_file "${cache}" "${lock}" ${container} ${swift_op} $*
+    release_lock "${lock}"
+  else
+    echo "$$ -- failed to acquire lock !!!"
+  fi
 }
 
 # merge files $1 and $2, and store the result in $1
@@ -140,6 +187,8 @@ function merge_cache_files() {
   local old="${1}"
   local new="${2}"
   local tmp="$(mktemp)"
+
+  test -f "${old}" || touch "${old}"
 
   sort ${new} > ${tmp}
   ( join -t: -j1 -v1 ${old} ${tmp} ; \
@@ -157,7 +206,6 @@ function refresh_cache_file() {
 
   # temp files
   local cache_new="${cache}-new"
-  trap 'rm -f ${cache_new}' EXIT
 
   # execute all swift tests and record the results
   f="${lock}/testfile.dat"
@@ -177,49 +225,30 @@ function refresh_cache_file() {
   echo "upload:$(now):$(upload_container $container ${f} ${f2})"         >> ${cache_new}
   echo "download:$(now):$(download_container $container ${f2} ${fcopy})" >> ${cache_new}
   echo "verify:$(now):$(verify_container ${f} ${fcopy})"                 >> ${cache_new}
+  echo "delete_o:$(now):$(delete_container $container ${f2})"            >> ${cache_new}
 
   rm -f "${f}" "${fcopy}"
 
   if ! is_io_test ${op}; then
-    echo "stats:$(now):$(stats_container $container)"    >> ${cache_new}
-    echo "delete:$(now):$(delete_container $container)"  >> ${cache_new}
+    echo "stats:$(now):$(stats_container $container)"     >> ${cache_new}
+    echo "delete_c:$(now):$(delete_container $container)" >> ${cache_new}
   fi
 
   set -e
 
-  # merge the two files, store the result in $cache, and remove $cache_new
+  # merge the files, save the result in $cache, and remove $cache_new
   merge_cache_files ${cache} ${cache_new}
 }
 
-function query_cache_file {
-  local cache="${1}"
-  local lock="${2}"
-  local container="${3}"
-  local op="${4}"
-
-  local cache_ts_key=""
-  declare -i cache_ts=0
-
-  if test -f "${cache}"; then
-    cache_ts_value=$(sed -n "s/^$op:\(.*\):\(.*\)$/\1:\2/p" "${cache}")
-    cache_ts="${cache_ts_value%%:*}"
-  fi
-
-  if should_cache_be_refreshed ${op} ${cache_ts}; then
-    refresh_cache_file $*
-
-    cache_ts_value=$(sed -n "s/^$op:\(.*\):\(.*\)$/\1:\2/p" "${cache}")
-    cache_ts="${cache_ts_value%%:*}"
-  fi
-
-  local value="${cache_ts_value#*:}"
-  echo "${value:--1}"
-}
-
-# lock operations -----------------------------------------------------
+# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+#
+#                           lock operations
 #
 # simplified version of: http://wiki.bash-hackers.org/howto/mutex
 #
+# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
 
 function on_error_handler() {
   local lock="${1}"
@@ -231,10 +260,9 @@ function on_error_handler() {
 
 function acquire_lock_wait() {
   local lock="${1}"
-  declare -i retry=${CACHE_RETRY_TIMES}
+  declare -i pid=${BASHPID}
 
-  while (( retry > 0 )); do
-
+  for i in $(seq ${LOCK_RETRY_TIMES}); do
     if test -d "${lock}"; then
       # 1. lock exists
       set +e
@@ -244,7 +272,6 @@ function acquire_lock_wait() {
         if ! kill -0 ${lockpid} &> /dev/null; then
           # lock is stale, lock holder is not running
           rm -r "${lock}"
-          (( retry -= 1 ))
           continue
         # else -> lock is still active
         fi
@@ -253,52 +280,52 @@ function acquire_lock_wait() {
 
     elif mkdir "${lock}" &> /dev/null; then
       # 2. lock acquired
-      trap 'on_error_handler "${lock}" $?' SIGINT SIGTERM SIGHUP
-      echo $$ > "${lock}"/pid
-      break
-    # else 3. lock missed, i.e. some other process grabbed it before us, bummer
+      trap 'on_error_handler "${lock}" 127' SIGINT SIGTERM SIGHUP
+      echo $pid > "${lock}"/pid
+      return 0
+    # else 3. lock missing, i.e. some other process grabbed it before us, bummer
     fi
 
-    (( retry -= 1 ))
-    sleep ${CACHE_RETRY_PAUSE}
+    sleep ${LOCK_RETRY_PAUSE}
   done
+
+  # max retries reached, failed to acquire lock
+  return 1
 }
 
 function release_lock() {
   rm -r "${1}"
 }
 
-# main ----------------------------------------------------------------
+# ---------------------------------------------------------------------
+#  main
+# ---------------------------------------------------------------------
 
 function get_swift_op_code() {
-  local swift_op="${1}"
-  shift
-
-  local cache="${WORKDIR}/zabbix-swift-monitor.cache"
-  local lock="${WORKDIR}/zabbix-swift-monitor.lock"
-  local container="${SWIFT_TEST_CONTAINER}:$(hostname)"
-
-  if is_io_test ${swift_op}; then
-    container="${SWIFT_TEST_IO_CONTAINER}:$(hostname)"
-  fi
-
-  acquire_lock_wait "${lock}"
-  query_cache_file "${cache}" "${lock}" ${container} ${swift_op} $*
-  release_lock "${lock}"
+  load_openstack_credentials "${CREDFILE}"
+  query_cache_file "${WORKDIR}/${CACHE_FILENAME}" $*
 }
 
-while getopts "c:d:fh" opt; do
+function usage() {
+  echo "usage: $0 -c <openstack cred file> -d <workdir> -s <test-file size> -z <zabbix-dir> -f swift-command"
+  echo
+
+  exit 1
+}
+
+while getopts "c:d:s:z:fh" opt; do
   case "${opt}" in
-    c) CREDFILE="${OPTARG}"     ;;
-    d) WORKDIR="${OPTARG}"      ;;
-    f) CACHE_FORCE_UPDATE="yes" ;;
-    h|*) usage                  ;;
+    c) CREDFILE="${OPTARG}"             ;;
+    d) WORKDIR="${OPTARG}"              ;;
+    f) CACHE_FORCE_UPDATE="yes"         ;;
+    s) ZABBIX_CONF_DIR="${OPTARG}"      ;;
+    s) SWIFT_TESTFILE_SIZE="${OPTARG}"  ;;
+    h|*) usage                          ;;
   esac
 done
 
 shift $((OPTIND-1))
 
-load_openstack_credentials "${CREDFILE}"
 get_swift_op_code $*
 
 # ---------------------------------------------------------------------

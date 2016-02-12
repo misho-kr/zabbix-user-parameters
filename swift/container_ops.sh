@@ -3,7 +3,7 @@
 #                  Execute tests with Swift container
 # ----------------------------------------------------------------------
 
-set -e
+set -ae
 
 ZABBIX_CONF_DIR="/etc/zabbix"
 # ZABBIX_AGENT_CONF="${ZABBIX_CONF_DIR}/zabbix_agentd.conf"
@@ -90,11 +90,13 @@ function verify_container() { cmp -s "${1}" "${2}"; echo $?; }
 # ---------------------------------------------------------------------
 # ---------------------------------------------------------------------
 
-declare -a IO_TEST_COMMANDS=(upload download verify delete_o)
-
+# time-stamp should be obtained AFTER the value is computed
+function make_ts_entry() { echo "${1}:$(now):${2}"; }
 function now() { echo "$(date +%s)" ; }
+
 function is_io_test() {
   local op=${1}
+  declare -a IO_TEST_COMMANDS=(upload download verify delete_o)
 
   for i in $(seq 0 $(( ${#IO_TEST_COMMANDS[@]} -1 )) ); do
     if [[ "${IO_TEST_COMMANDS[i]}" == ${op} ]]; then
@@ -105,12 +107,13 @@ function is_io_test() {
   return 1 # not found, i.e. op is not io-test
 }
 
-function get_cache_state() {
+function get_cache_state_from_ts() {
   local op=${1}
   declare -i cache_ts=${2}
 
   is_io_test ${op}
   declare -i is_io_test_op=$?
+  declare -i io_ttl=${CACHE_IO_TEST_TTL}
 
   if \
     (( $is_io_test_op == 0 && $(now) > (cache_ts + (CACHE_MAX_TTL_AGE * CACHE_IO_TEST_TTL)) )) || \
@@ -128,43 +131,52 @@ function get_cache_state() {
   fi
 }
 
-function query_cache_file {
+function get_cache_state_only() {
+  local cache_state="$(get_cache_state $*)"
+  echo "${cache_state%%:*}"
+}
+
+function get_cache_state() {
   local cache="${1}"
   local op="${2}"
 
-  local cache_entry=""
-  local cache_value=""
+  local cache_value="nan"
   declare -i cache_ts=0
 
   if test -f "${cache}"; then
-    cache_entry=$(sed -n "s/^$op:\(.*\):\(.*\)$/\1:\2/p" "${cache}")
+    local cache_entry=$(sed -n "s/^$op:\(.*\):\(.*\)$/\1:\2/p" "${cache}")
     cache_ts="${cache_entry%%:*}"
     cache_value="${cache_entry#*:}"
   fi
 
-  case "$(get_cache_state ${op} ${cache_ts:-0})" in
-    "obsolete" ) update_cache_file_background $* ; echo "1" ;;
-    "stale"    ) update_cache_file_background $* ; echo "${cache_value}" ;;
-    "current"  )
-        [[ "${CACHE_FORCE_UPDATE}" == "yes" ]] && update_cache_file_background $*
-        echo "${cache_value}"
-        ;;
+  echo "$(get_cache_state_from_ts ${op} ${cache_ts:-0}):${cache_value}"
+}
+
+function query_cache_file {
+  local cache="${1}"
+  local op="${2}"
+
+  local cache_state="$(get_cache_state ${cache} ${op})"
+  case "${cache_state%%:*}" in
+    "obsolete" ) echo "${CACHE_OBSOLETE_RET_VALUE}"; update_cache_file_background $* ;;
+    "stale"    ) echo "${cache_state#*:}" ;          update_cache_file_background $* ;;
+    "current"  ) echo "${cache_state#*:}"
+                 [[ ${CACHE_FORCE_UPDATE} == "yes" ]] && update_cache_file_background $*
+                 ;;
     *)
-        echo "-1"
-        ;;
+        echo "${SWIFT_OP_UNKNOWN_RET_VALUE}" ;;
   esac
 }
 
 function update_cache_file_background() {
-  (update_cache_file $*) &
+  nohup bash -c "update_cache_file $*" < /dev/null &> /dev/null &
+  # update_cache_file $*
 }
 
 function update_cache_file() {
   local cache="${1}"
   local swift_op="${2}"
   shift 2
-
-  trap '' HUP
 
   local lock="${WORKDIR}/zabbix-swift-monitor.lock"
   local container="${SWIFT_TEST_CONTAINER}:$(hostname)"
@@ -174,7 +186,13 @@ function update_cache_file() {
   fi
 
   if acquire_lock_wait "${lock}"; then
-    refresh_cache_file "${cache}" "${lock}" ${container} ${swift_op} $*
+    # check if update is required, in case this process had to wait and
+    # another process refreshed the values
+    if [[ ${CACHE_FORCE_UPDATE} == "yes" || \
+          "$(get_cache_state_only ${cache} ${op})" != "current" ]]
+    then
+      refresh_cache_file "${cache}" "${lock}" ${container} ${swift_op} $*
+    fi
     release_lock "${lock}"
   else
     echo "$$ -- failed to acquire lock !!!"
@@ -218,20 +236,20 @@ function refresh_cache_file() {
   set +e
 
   if ! is_io_test ${op}; then
-    echo "create:$(now):$(create_container $container)"  >> ${cache_new}
-    echo "list:$(now):$(list_container $container)"      >> ${cache_new}
+    echo "$(make_ts_entry create $(create_container $container))" >> ${cache_new}
+    echo "$(make_ts_entry list   $(list_container   $container))" >> ${cache_new}
   fi
 
-  echo "upload:$(now):$(upload_container $container ${f} ${f2})"         >> ${cache_new}
-  echo "download:$(now):$(download_container $container ${f2} ${fcopy})" >> ${cache_new}
-  echo "verify:$(now):$(verify_container ${f} ${fcopy})"                 >> ${cache_new}
-  echo "delete_o:$(now):$(delete_container $container ${f2})"            >> ${cache_new}
+  echo "$(make_ts_entry upload   $(upload_container   $container ${f} ${f2}))"     >> ${cache_new}
+  echo "$(make_ts_entry download $(download_container $container ${f2} ${fcopy}))" >> ${cache_new}
+  echo "$(make_ts_entry verify   $(verify_container   ${f} ${fcopy}))"             >> ${cache_new}
+  echo "$(make_ts_entry delete_o $(delete_container   $container ${f2}))"          >> ${cache_new}
 
   rm -f "${f}" "${fcopy}"
 
   if ! is_io_test ${op}; then
-    echo "stats:$(now):$(stats_container $container)"     >> ${cache_new}
-    echo "delete_c:$(now):$(delete_container $container)" >> ${cache_new}
+    echo "$(make_ts_entry stats    $(stats_container  $container))" >> ${cache_new}
+    echo "$(make_ts_entry delete_c $(delete_container $container))" >> ${cache_new}
   fi
 
   set -e

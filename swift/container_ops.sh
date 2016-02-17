@@ -11,6 +11,9 @@ ZABBIX_AGENT_SCRIPTS="${ZABBIX_CONF_DIR}/scripts"
 
 source "${ZABBIX_AGENT_SCRIPTS}/swift/container_ops.conf"
 
+function now() { echo "$(date +%s)" ; }
+function log() { echo "$(date +%Y, %h %d %H:%M:%S) > $*"; }
+
 # ---------------------------------------------------------------------
 # ---------------------------------------------------------------------
 #                         Swift operations
@@ -40,28 +43,22 @@ function load_openstack_credentials() {
   os_password="${os_password:-${OS_PASSWORD}}"
 }
 
+# execute swift operation and send all output to /dev/null
 function swift_op() {
+  log "swift-op => " $*
   swift \
       --os-auth-url    ${os_auth_url}    \
       --os-tenant-name ${os_tenant_name} \
       --os-username    ${os_username}    \
       --os-password    ${os_password}    \
           $*
-
-  # 0 = success, 1 = fail
 }
 
-# execute swift operation and send all output to /dev/null
-function swift_op_noout() {
-  swift_op $* &> /dev/null
-  echo $?
-}
-
-# Swift container tests
-function create_container() { swift_op_noout post $* ;      }
-function list_container()   { swift_op_noout list --lh $* ; }
-function stats_container()  { swift_op_noout stat $* ;      }
-function delete_container() { swift_op_noout delete $* ;    }
+# Swift container tests; required arg is container name
+function create_container() { swift_op post $* ;      }
+function list_container()   { swift_op list --lh $* ; }
+function stats_container()  { swift_op stat $* ;      }
+function delete_container() { swift_op delete $* ;    }
 
 # Swift container I/O tests
 function upload_container() {
@@ -69,20 +66,20 @@ function upload_container() {
   local local_file="${2}"
   local container_file="${3}"
 
-  swift_op_noout upload "${container}" "${local_file}" --object-name "${container_file}"
+  swift_op upload "${container}" "${local_file}" --object-name "${container_file}"
 }
 
-# 6. Download from swift container
+# Download from swift container
 function download_container() {
   local container="${1}"
   local container_file="${2}"
   local datafile="${3}"
 
-  swift_op_noout download "${container}" "${container_file}" -o "${datafile}"
+  swift_op download "${container}" "${container_file}" -o "${datafile}"
 }
 
-# 7. Verify swift container
-function verify_container() { cmp -s "${1}" "${2}"; echo $?; }
+# Verify content of swift container, i.e. compare uploaded and downloaded files
+function verify_container() { cmp -s "${1}" "${2}"; }
 
 # ---------------------------------------------------------------------
 # ---------------------------------------------------------------------
@@ -92,7 +89,6 @@ function verify_container() { cmp -s "${1}" "${2}"; echo $?; }
 
 # time-stamp should be obtained AFTER the value is computed
 function make_ts_entry() { echo "${1}:$(now):${2}"; }
-function now() { echo "$(date +%s)" ; }
 
 function is_io_test() {
   local op=${1}
@@ -112,8 +108,7 @@ function get_cache_state_from_ts() {
   declare -i cache_ts=${2}
 
   is_io_test ${op}
-  declare -i is_io_test_op=$?
-  declare -i io_ttl=${CACHE_IO_TEST_TTL}
+  declare -i is_io_test_op="$?"
 
   if \
     (( $is_io_test_op == 0 && $(now) > (cache_ts + (CACHE_MAX_TTL_AGE * CACHE_IO_TEST_TTL)) )) || \
@@ -169,19 +164,25 @@ function query_cache_file {
 }
 
 function update_cache_file_background() {
-  nohup bash -c "update_cache_file $*" < /dev/null &> /dev/null &
+  local logfile="/dev/null"
+
+  if [[ "${TEST_LOGGING}" == "yes" ]]l; then
+    logfile="${WORKDIR}/${LOG_FILENAME}"
+  fi
+
+  nohup bash -c "update_cache_file $*" < /dev/null &> "${logfile}" &
   # update_cache_file $*
 }
 
 function update_cache_file() {
   local cache="${1}"
-  local swift_op="${2}"
+  local op="${2}"
   shift 2
 
   local lock="${WORKDIR}/zabbix-swift-monitor.lock"
   local container="${SWIFT_TEST_CONTAINER}:$(hostname)"
 
-  if is_io_test ${swift_op}; then
+  if is_io_test ${op}; then
     container="${SWIFT_TEST_IO_CONTAINER}:$(hostname)"
   fi
 
@@ -191,7 +192,7 @@ function update_cache_file() {
     if [[ ${CACHE_FORCE_UPDATE} == "yes" || \
           "$(get_cache_state_only ${cache} ${op})" != "current" ]]
     then
-      refresh_cache_file "${cache}" "${lock}" ${container} ${swift_op} $*
+      refresh_cache_file "${cache}" "${lock}" ${container} ${op} $*
     fi
     release_lock "${lock}"
   else
@@ -216,6 +217,7 @@ function merge_cache_files() {
   rm ${tmp} && mv ${new} ${old}
 }
 
+# execute all swift tests and record the results
 function refresh_cache_file() {
   local cache="${1}"
   local lock="${2}"
@@ -225,7 +227,6 @@ function refresh_cache_file() {
   # temp files
   local cache_new="${cache}-new"
 
-  # execute all swift tests and record the results
   f="${lock}/testfile.dat"
   fcopy="${lock}/testfile-copy.dat"
   f2="$(basename "${f}")"
@@ -236,20 +237,20 @@ function refresh_cache_file() {
   set +e
 
   if ! is_io_test ${op}; then
-    echo "$(make_ts_entry create $(create_container $container))" >> ${cache_new}
-    echo "$(make_ts_entry list   $(list_container   $container))" >> ${cache_new}
+    create_container $container;    make_ts_entry create $? >> ${cache_new}
+    list_container   $container;    make_ts_entry list   $? >> ${cache_new}
   fi
 
-  echo "$(make_ts_entry upload   $(upload_container   $container ${f} ${f2}))"     >> ${cache_new}
-  echo "$(make_ts_entry download $(download_container $container ${f2} ${fcopy}))" >> ${cache_new}
-  echo "$(make_ts_entry verify   $(verify_container   ${f} ${fcopy}))"             >> ${cache_new}
-  echo "$(make_ts_entry delete_o $(delete_container   $container ${f2}))"          >> ${cache_new}
+  upload_container   $container ${f} ${f2};     make_ts_entry upload   $? >> ${cache_new}
+  download_container $container ${f2} ${fcopy}; make_ts_entry download $? >> ${cache_new}
+  verify_container   $container ${f}  ${fcopy}; make_ts_entry verify   $? >> ${cache_new}
+  delete_container   $container ${f2};          make_ts_entry delete_o $? >> ${cache_new}
 
   rm -f "${f}" "${fcopy}"
 
   if ! is_io_test ${op}; then
-    echo "$(make_ts_entry stats    $(stats_container  $container))" >> ${cache_new}
-    echo "$(make_ts_entry delete_c $(delete_container $container))" >> ${cache_new}
+    stats_container  $container;    make_ts_entry stats    $? >> ${cache_new}
+    delete_container $container;    make_ts_entry delete_c $? >> ${cache_new}
   fi
 
   set -e
@@ -325,20 +326,21 @@ function get_swift_op_code() {
 }
 
 function usage() {
-  echo "usage: $0 -c <openstack cred file> -d <workdir> -s <test-file size> -z <zabbix-dir> -f swift-command"
+  echo "usage: $0 -c <openstack cred file> -d <workdir>  -f -l -s <test-file size> -z <zabbix-dir>swift-command"
   echo
 
   exit 1
 }
 
-while getopts "c:d:s:z:fh" opt; do
+while getopts "c:d:fhls:z:" opt; do
   case "${opt}" in
-    c) CREDFILE="${OPTARG}"             ;;
-    d) WORKDIR="${OPTARG}"              ;;
-    f) CACHE_FORCE_UPDATE="yes"         ;;
-    s) ZABBIX_CONF_DIR="${OPTARG}"      ;;
-    s) SWIFT_TESTFILE_SIZE="${OPTARG}"  ;;
-    h|*) usage                          ;;
+    c) CREDFILE="${OPTARG}"            ;;
+    d) WORKDIR="${OPTARG}"             ;;
+    f) CACHE_FORCE_UPDATE="yes"        ;;
+    l) TEST_LOGGING="yes"              ;;
+    s) SWIFT_TESTFILE_SIZE="${OPTARG}" ;;
+    z) ZABBIX_CONF_DIR="${OPTARG}"     ;;
+    h|*) usage                         ;;
   esac
 done
 

@@ -12,7 +12,7 @@ ZABBIX_AGENT_SCRIPTS="${ZABBIX_CONF_DIR}/scripts"
 source "${ZABBIX_AGENT_SCRIPTS}/swift/container_ops.conf"
 
 function now() { echo "$(date +%s)" ; }
-function log() { echo "$(date +%Y, %h %d %H:%M:%S) > $*"; }
+function log() { echo "$(date '+%Y, %h %d %H:%M:%S') > $*"; }
 
 # ---------------------------------------------------------------------
 # ---------------------------------------------------------------------
@@ -45,13 +45,18 @@ function load_openstack_credentials() {
 
 # execute swift operation and send all output to /dev/null
 function swift_op() {
-  log "swift-op => " $*
+  log "swift-op =>" $*
   swift \
       --os-auth-url    ${os_auth_url}    \
       --os-tenant-name ${os_tenant_name} \
       --os-username    ${os_username}    \
       --os-password    ${os_password}    \
           $*
+
+  local rc="$?"
+  log "completed, rc($rc)"
+
+  return ${rc}
 }
 
 # Swift container tests; required arg is container name
@@ -79,7 +84,15 @@ function download_container() {
 }
 
 # Verify content of swift container, i.e. compare uploaded and downloaded files
-function verify_container() { cmp -s "${1}" "${2}"; }
+function verify_container() {
+  log "swift-op => compare" $*
+  cmp -s "${1}" "${2}"
+
+  local rc="$?"
+  log "completed, rc($rc)"
+
+  return ${rc}
+}
 
 # ---------------------------------------------------------------------
 # ---------------------------------------------------------------------
@@ -166,11 +179,11 @@ function query_cache_file {
 function update_cache_file_background() {
   local logfile="/dev/null"
 
-  if [[ "${TEST_LOGGING}" == "yes" ]]l; then
+  if [[ "${TEST_LOGGING}" == "yes" ]]; then
     logfile="${WORKDIR}/${LOG_FILENAME}"
   fi
 
-  nohup bash -c "update_cache_file $*" < /dev/null &> "${logfile}" &
+  nohup bash -c "update_cache_file $*" < /dev/null &>> "${logfile}" &
   # update_cache_file $*
 }
 
@@ -241,9 +254,9 @@ function refresh_cache_file() {
     list_container   $container;    make_ts_entry list   $? >> ${cache_new}
   fi
 
-  upload_container   $container ${f} ${f2};     make_ts_entry upload   $? >> ${cache_new}
+  upload_container   $container ${f}  ${f2};    make_ts_entry upload   $? >> ${cache_new}
   download_container $container ${f2} ${fcopy}; make_ts_entry download $? >> ${cache_new}
-  verify_container   $container ${f}  ${fcopy}; make_ts_entry verify   $? >> ${cache_new}
+  verify_container              ${f}  ${fcopy}; make_ts_entry verify   $? >> ${cache_new}
   delete_container   $container ${f2};          make_ts_entry delete_o $? >> ${cache_new}
 
   rm -f "${f}" "${fcopy}"

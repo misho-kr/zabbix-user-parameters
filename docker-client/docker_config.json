@@ -1,11 +1,9 @@
-# ----------------------------------------------------------------------
-#    Docker client config to execute test docker operations
-# ----------------------------------------------------------------------
-
 {
+  "comment": "client config to execute test docker operations",
   "auths": {
     "docker-host": {
       "auth":   "<credentials>",
       "email":  "<email>"
     }
+  }
 }

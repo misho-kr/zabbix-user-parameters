@@ -12,7 +12,7 @@ ZABBIX_AGENT_SCRIPTS="${ZABBIX_CONF_DIR}/scripts"
 source "${ZABBIX_AGENT_SCRIPTS}/docker-client/docker_ops.conf"
 
 function now() { echo "$(date +%s)" ; }
-function log() { echo "$(date +%Y, %h %d %H:%M:%S) > $*"; }
+function log() { echo "$(date '+%Y, %h %d %H:%M:%S') > $*"; }
 
 # ---------------------------------------------------------------------
 # ---------------------------------------------------------------------
@@ -21,21 +21,21 @@ function log() { echo "$(date +%Y, %h %d %H:%M:%S) > $*"; }
 # ---------------------------------------------------------------------
 
 function docker_pull() {
-  log docker-pull $*
+  log "docker-pull =>" $*
 
   # NB: clean up so the following pull operation will download new image
-  docker rmi ${DOCKER_TEST_IMAGE} &> /dev/null
+  docker rmi ${1} &> /dev/null
 
   # test, i.e. pull
-  docker pull ${DOCKER_TEST_IMAGE}
+  docker --config="${DOCKER_CONF_DIR}" pull $*
 }
 
 function docker_push() {
-  log docker-push $*
+  log "docker-push =>" $*
 
   # NB: unless the image is removed from the remore repo, this push
   # operation will not upload new content to the remote repo
-  docker push ${DOCKER_TEST_IMAGE}
+  docker --config="${DOCKER_CONF_DIR}" push $*
 }
 
 # ---------------------------------------------------------------------
@@ -50,10 +50,6 @@ function make_ts_entry() { echo "${1}:$(now):${2}"; }
 function get_cache_state_from_ts() {
   local op=${1}
   declare -i cache_ts=${2}
-
-  is_io_test ${op}
-  declare -i is_io_test_op=$?
-  declare -i io_ttl=${CACHE_IO_TEST_TTL}
 
   if (( $(now) > (cache_ts + (CACHE_MAX_TTL_AGE * CACHE_TEST_TTL)) )); then
     echo "obsolete"
@@ -99,18 +95,18 @@ function query_cache_file {
                  [[ ${CACHE_FORCE_UPDATE} == "yes" ]] && update_cache_file_background $*
                  ;;
     *)
-        echo "${SWIFT_OP_UNKNOWN_RET_VALUE}" ;;
+        echo "${DOCKER_OP_UNKNOWN_RET_VALUE}" ;;
   esac
 }
 
 function update_cache_file_background() {
   local logfile="/dev/null"
 
-  if [[ "${TEST_LOGGING}" == "yes" ]]l; then
+  if [[ "${TEST_LOGGING}" == "yes" ]]; then
     logfile="${WORKDIR}/${LOG_FILENAME}"
   fi
 
-  nohup bash -c "update_cache_file $*" < /dev/null &> "${logfile}" &
+  nohup bash -c "update_cache_file $*" < /dev/null &>> "${logfile}" &
   # update_cache_file $*
 }
 
@@ -164,8 +160,8 @@ function refresh_cache_file() {
   # docker op may fail, and that is OK
   set +e
 
-  docker_pull; make_ts_entry docker_pull $? >> ${cache_new}
-  docker_push; make_ts_entry docker_push $? >> ${cache_new}
+  docker_pull ${DOCKER_TEST_IMAGE}; make_ts_entry pull $? >> ${cache_new}
+  docker_push ${DOCKER_TEST_IMAGE}; make_ts_entry push $? >> ${cache_new}
 
   set -e
 
@@ -239,7 +235,7 @@ function get_docker_op_code() {
 }
 
 function usage() {
-  echo "usage: $0 -c <docker config dif> -d <workdir> -f -i <docker image> -l -n <repo namespace> -z <zabbix-dir> swift-command"
+  echo "usage: $0 -c <docker config dif> -d <workdir> -f -i <docker image> -l -n <repo namespace> -z <zabbix-dir> docker-command"
   echo
 
   exit 1
